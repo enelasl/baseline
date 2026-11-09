@@ -13,33 +13,74 @@ jobs:
       run:
         shell: bash
     steps:
+      - name: 0. Workflow version marker
+        run: echo "WORKFLOW_VERSION=5"
+
       - name: 1. Checkout
         uses: actions/checkout@v4
 
-      - name: 2. Verify patch is present
+      - name: 2. Normalize patch line endings
         run: |
           echo "=== repo root ==="
           pwd
           ls -la
-          echo "=== patch size ==="
-          wc -c lan-only.patch
-          head -n 5 lan-only.patch
+          PATCH=$(ls -1 *.patch 2>/dev/null | head -n 1 || true)
+          if [ -z "$PATCH" ]; then
+            echo "::error::No .patch file in repository root."
+            exit 1
+          fi
+          echo "found: $PATCH"
+          python - "$PATCH" <<'PY'
+          import sys, pathlib
+          p = pathlib.Path(sys.argv[1])
+          raw = p.read_bytes()
+          print(f"before: {len(raw)} bytes, CR={raw.count(13)}, LF={raw.count(10)}")
+          fixed = raw.replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+          p.write_bytes(fixed)
+          print(f"after : {len(fixed)} bytes, CR={fixed.count(13)}, LF={fixed.count(10)}")
+          PY
+          echo "PATCH_FILE=$PWD/$PATCH" >> "$GITHUB_ENV"
+          echo "=== first lines (^M would show as ^M$) ==="
+          head -n 6 "$PATCH" | cat -A
 
       - name: 3. Clone upstream v0.3.3
         run: |
           git clone --depth 1 --branch v0.3.3 https://github.com/oinkvm/oink.git oink
           cd oink
-          git rev-parse HEAD
-          git log -1 --oneline
+          echo "HEAD: $(git rev-parse HEAD)"
+          echo "lib.rs CR count: $(tr -cd '\r' < crates/oink-network/src/lib.rs | wc -c)"
 
       - name: 4. Apply patch
         run: |
-          cp lan-only.patch oink/lan-only.patch
+          cp "$PATCH_FILE" oink/lan-only.patch
           cd oink
-          git apply --verbose --whitespace=nowarn lan-only.patch
+          ok=0
+          for opts in "" "--ignore-whitespace" "-C1" "--3way"; do
+            echo "--- trying: git apply $opts ---"
+            if git apply $opts --verbose --whitespace=nowarn lan-only.patch; then
+              echo "APPLIED with: git apply $opts"
+              ok=1
+              break
+            fi
+            git checkout -- . 2>/dev/null || true
+            rm -f crates/oink-network/src/lan.rs
+          done
+          if [ "$ok" != "1" ]; then
+            echo "--- trying: patch -p1 ---"
+            patch -p1 --batch --forward < lan-only.patch && ok=1
+          fi
+          if [ "$ok" != "1" ]; then
+            echo "::error::all patch strategies failed"
+            exit 1
+          fi
           rm -f lan-only.patch
+          echo "=== changed files ==="
           git status --short
-          ls -la crates/oink-network/src/lan.rs
+          echo "=== sanity ==="
+          test -f crates/oink-network/src/lan.rs && echo "lan.rs present"
+          grep -n "mod lan;" crates/oink-network/src/lib.rs
+          echo "is_lan in runtime.rs: $(grep -c is_lan crates/oink-network/src/link/runtime.rs)"
+          echo "is_lan in core.rs: $(grep -c is_lan crates/oink-network/src/link/core.rs)"
 
       - name: 5. Commit patched tree
         run: |
@@ -72,7 +113,7 @@ jobs:
           cache: npm
           cache-dependency-path: oink/package-lock.json
 
-      - name: 10. Pin npm 11.11.0
+      - name: 10. Pin npm and print versions
         run: |
           npm install --global npm@11.11.0
           echo "rustc: $(rustc --version)"
