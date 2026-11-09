@@ -1,0 +1,78 @@
+name: LAN-only build
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-2022
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout (patch + workflow)
+        uses: actions/checkout@v5
+
+      - name: Clone upstream oink at v0.3.3
+        run: |
+          git clone --depth 1 --branch v0.3.3 https://github.com/oinkvm/oink.git oink
+
+      - name: Apply LAN-only patch and commit
+        working-directory: oink
+        run: |
+          cp ../lan-only.patch lan-only.patch
+          git apply lan-only.patch
+          rm lan-only.patch
+          git add -A
+          git -c user.email="actions@github.com" -c user.name="GitHub Actions" \
+            commit -m "LAN-only: restrict peers to private networks and disable internet features"
+
+      - name: Install Rust 1.99.0
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: '1.99.0'
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x64-lan-only
+
+      - name: Install Python 3.14.6
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.14.6'
+
+      - name: Install Node 24.14.1
+        uses: actions/setup-node@v5
+        with:
+          node-version: '24.14.1'
+          cache: npm
+          cache-dependency-path: oink/package-lock.json
+
+      - name: Pin npm 11.11.0
+        run: npm install --global npm@11.11.0
+
+      - name: Install cargo-about 0.9.2
+        run: |
+          if ! cargo about --version 2>/dev/null | grep -q '0.9.2$'; then
+            cargo install cargo-about --version 0.9.2 --locked --features cli
+          fi
+
+      - name: npm ci
+        working-directory: oink
+        run: npm ci
+
+      - name: Build LAN-only MSI
+        working-directory: oink
+        run: python build-support/package.py --platform windows --build 1 --output-root ../build-out
+
+      - name: Upload MSI
+        uses: actions/upload-artifact@v4
+        with:
+          name: oink-lan-only-msi
+          path: build-out/**/*.msi
+          if-no-files-found: error
