@@ -124,7 +124,14 @@ jobs:
       - name: 11. npm ci
         working-directory: oink
         run: npm ci
-
+        
+      - name: 11b. Install cargo-about 0.9.2
+        run: |
+          if ! cargo about --version 2>/dev/null | grep -q '0.9.2$'; then
+            cargo install cargo-about --version 0.9.2 --locked --features cli
+          fi
+          cargo about --version
+          
       - name: 12. Build LAN-only MSI
         working-directory: oink
         run: python build-support/package.py --platform windows --build 1 --output-root ../build-out
