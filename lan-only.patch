@@ -1,0 +1,324 @@
+diff --git a/crates/oink-network/src/lan.rs b/crates/oink-network/src/lan.rs
+new file mode 100644
+--- /dev/null
++++ b/crates/oink-network/src/lan.rs
+@@ -0,0 +1,12 @@
++//! LAN-only build: reject any peer address that is not on a private/loopback/link-local network.
++
++use std::net::SocketAddr;
++
++/// Returns true only for addresses that are guaranteed to stay inside the local
++/// network: loopback, RFC 1918 private ranges, and link-local addresses.
++pub(crate) fn is_lan(addr: SocketAddr) -> bool {
++    match addr.ip() {
++        std::net::IpAddr::V4(ip) => ip.is_private() || ip.is_loopback() || ip.is_link_local(),
++        std::net::IpAddr::V6(ip) => ip.is_loopback() || ip.is_unicast_link_local(),
++    }
++}
+
+diff --git a/crates/oink-network/src/lib.rs b/crates/oink-network/src/lib.rs
+--- a/crates/oink-network/src/lib.rs
++++ b/crates/oink-network/src/lib.rs
+@@ -6,6 +6,7 @@
+ use std::time::Duration;
+ 
+ mod activity;
++mod lan;
+ #[cfg(target_os = "macos")]
+ mod local_network;
+ #[cfg(target_os = "macos")]
+
+diff --git a/crates/oink-network/src/link/core.rs b/crates/oink-network/src/link/core.rs
+--- a/crates/oink-network/src/link/core.rs
++++ b/crates/oink-network/src/link/core.rs
+@@ -269,6 +269,10 @@
+         mode: DialMode,
+         now: Instant,
+     ) -> Result<(), DialRefused> {
++        // LAN-only build: keep only private/loopback/link-local peer addresses
++        // and never use a public relay.
++        let addresses: Vec<SocketAddr> = addresses.into_iter().filter(|a| crate::lan::is_lan(*a)).collect();
++        let _mode = mode;
+         let installing = self.peer_link(peer);
+         if installing.is_some_and(|id| self.links[&id].installed) {
+             return Err(DialRefused::AlreadyLinked);
+@@ -281,7 +285,7 @@
+         self.dials.insert(
+             peer,
+             Dial {
+-                mode,
++                mode: DialMode::DirectOnly,
+                 addresses: addresses.clone(),
+                 direct,
+                 deadline: now + DIAL_BUDGET,
+@@ -303,10 +307,8 @@
+         if direct {
+             self.effects.push_back(Effect::Dial { peer, addresses });
+         }
+-        if mode == DialMode::All || !direct && mode == DialMode::PreferDirect {
+-            self.request_relay(peer, now);
+-        }
+-        if !direct && mode == DialMode::DirectOnly {
++        // LAN-only build: never request a public relay.
++        if !direct {
+             self.fail_dial(peer, DialFailure::Unreachable);
+         }
+         Ok(())
+@@ -909,7 +911,16 @@
+                     && !self.dials.contains_key(&l.peer.device_id)
+                     && !l.addresses.is_empty()
+             })
+-            .map(|l| (l.peer.device_id, l.addresses.clone()))
++            .map(|l| {
++                (
++                    l.peer.device_id,
++                    l.addresses
++                        .iter()
++                        .copied()
++                        .filter(|a| crate::lan::is_lan(*a))
++                        .collect::<Vec<_>>(),
++                )
++            })
+             .collect();
+         for (peer, addresses) in due {
+             if self.dials.len() >= MAX_DIALS {
+
+diff --git a/crates/oink-network/src/link/runtime.rs b/crates/oink-network/src/link/runtime.rs
+--- a/crates/oink-network/src/link/runtime.rs
++++ b/crates/oink-network/src/link/runtime.rs
+@@ -1134,7 +1134,12 @@
+                 }
+             }
+             Command::ProbeAddress(address, reply) => {
+-                if self.address_probes.len() >= MAX_DIALS {
++                // LAN-only build: never probe a non-local address.
++                if !crate::lan::is_lan(address) {
++                    let _ = reply.send(Err(AddressProbeError::from_io(&std::io::Error::other(
++                        "LAN-only build refuses non-local addresses",
++                    ))));
++                } else if self.address_probes.len() >= MAX_DIALS {
+                     let _ = reply.send(Err(AddressProbeError::Busy));
+                 } else {
+                     let setup = || -> Result<_, AddressProbeError> {
+@@ -1917,6 +1922,9 @@
+                     .count();
+             if pending >= MAX_INBOUND_PENDING {
+                 incoming.refuse();
++            } else if !crate::lan::is_lan(incoming.remote_address()) {
++                // LAN-only build: drop inbound connections from non-local addresses.
++                incoming.refuse();
+             } else if let Ok(connecting) = incoming.accept() {
+                 self.inbound.push(Handshake {
+                     trace: None,
+@@ -2072,6 +2080,10 @@
+                     let Some(address) = dial.addresses.pop_front() else {
+                         break;
+                     };
++                    // LAN-only build: skip any non-local candidate.
++                    if !crate::lan::is_lan(address) {
++                        continue;
++                    }
+                     let id = ConnectionId {
+                         initiator_boot: self.core.boot,
+                         random: rand::random(),
+
+diff --git a/crates/oink-winsvc/src/platform/update/service.rs b/crates/oink-winsvc/src/platform/update/service.rs
+--- a/crates/oink-winsvc/src/platform/update/service.rs
++++ b/crates/oink-winsvc/src/platform/update/service.rs
+@@ -614,71 +614,9 @@
+     prepared: Option<worker::PreparedPackage>,
+ }
+ fn check_feed(state: &Arc<Mutex<State>>, roots: &Roots) -> Result<Option<Selected>, Error> {
+-    let (policy, installed, revision) = {
+-        let mut state = state.lock().unwrap();
+-        state.status.phase = Phase::Checking;
+-        state.last_check = Some(Instant::now());
+-        (state.policy.clone(), state.status.current_build, state.revision)
+-    };
+-    let envelope = http(&feed::manifest_url(), feed::MAX_FEED as u64, false)?;
+-    let seen = policy.watermarks.get("stable").cloned().unwrap_or_default();
+-    let manifest = feed::verify_manifest(&envelope, &roots.feed(), &seen, now())?;
+-    let os_build = worker::windows_build()?;
+-    let release = manifest
+-        .select(&Selection {
+-            windows_build: os_build,
+-            architecture: "x64",
+-            installed_build: installed,
+-            successful_build: policy.successful_build,
+-            quarantine: &policy.quarantine,
+-        })?
+-        .cloned();
+-    if let Some(release) = &release {
+-        feed::verify_version(&release.version, &state.lock().unwrap().status.version)?;
+-    }
+-    let mut state = state.lock().unwrap();
+-    if state.revision != revision {
+-        return Err(Error::Busy);
+-    }
+-    state
+-        .policy
+-        .watermarks
+-        .insert("stable".into(), manifest.watermark().clone());
+-    save_policy(&state.policy)?;
+-    state.status.checked_at = Some(now());
+-    state.status.next_check = Some(now() + 24 * 3600);
+-    state.status.error = if release.is_none()
+-        && manifest.manifest().releases.iter().any(|r| {
+-            r.build > installed.max(policy.successful_build)
+-                && r.architecture == "x64"
+-                && r.minimum_windows_build > os_build
+-        }) {
+-        Some(Error::OsUnsupported)
+-    } else {
+-        None
+-    };
+-    state.status.candidate = release.as_ref().map(|release| Candidate {
+-        local_package: false,
+-        build: release.build,
+-        version: release.version.clone(),
+-        size: release.package.length,
+-        published_at: None,
+-        severity: release.severity,
+-        notes: Some(release.notes.clone()),
+-    });
+-    state.status.phase = if release.is_some() {
+-        Phase::Available
+-    } else if state.status.error.is_some() {
+-        Phase::Failed
+-    } else {
+-        Phase::Idle
+-    };
+-    Ok(release.map(|release| Selected {
+-        manifest: Some(manifest),
+-        envelope,
+-        release,
+-        prepared: None,
+-    }))
++    // LAN-only build: never contact the update feed.
++    let _ = (state, roots);
++    return Ok(None);
+ }
+ fn download(selected: &mut Selected, roots: &Roots, state: &Arc<Mutex<State>>) -> Result<(), Error> {
+     if let Some(manifest) = &selected.manifest {
+
+diff --git a/apps/oink/src-tauri/src/sponsor.rs b/apps/oink/src-tauri/src/sponsor.rs
+--- a/apps/oink/src-tauri/src/sponsor.rs
++++ b/apps/oink/src-tauri/src/sponsor.rs
+@@ -67,19 +67,9 @@
+ impl SponsorList {
+     #[cfg(any(target_os = "macos", windows))]
+     pub(crate) fn start() -> Self {
+-        // Outer Option distinguishes pending from failure. Recreated windows share
+-        // the same startup request and in-memory result; nothing is saved to disk.
++        // LAN-only build: never fetch the sponsor list from the internet.
+         let (complete, result) = watch::channel(None);
+-        tauri::async_runtime::spawn(async move {
+-            let items = match client() {
+-                Ok(client) => tokio::time::timeout(Duration::from_secs(30), load(&client, URL))
+-                    .await
+-                    .ok()
+-                    .flatten(),
+-                Err(_) => None,
+-            };
+-            complete.send_replace(Some(items));
+-        });
++        complete.send_replace(Some(None));
+         Self(result)
+     }
+ 
+
+diff --git a/crates/oink-agent/src/telemetry/mod.rs b/crates/oink-agent/src/telemetry/mod.rs
+--- a/crates/oink-agent/src/telemetry/mod.rs
++++ b/crates/oink-agent/src/telemetry/mod.rs
+@@ -485,64 +485,8 @@
+         let consent = state.consent;
+         #[cfg(windows)]
+         self.start_native(consent);
+-        if !consent.granted() || state.store.is_none() {
+-            return;
+-        }
+-        let (Some(endpoint), Some(manifest)) = (self.endpoint.clone(), self.manifest.as_ref()) else {
+-            return;
+-        };
+-        let Ok(https) = Https::new(endpoint) else { return };
+-        self.recover_and_arm(&mut state, consent, manifest);
+-        self.ingress
+-            .enabled_us
+-            .store(self.ingress.epoch.elapsed().as_micros() as u64, Ordering::Release);
+-        self.ingress.realtime.arm(consent.generation, Instant::now());
+-        self.ingress.generation.store(consent.generation, Ordering::Release);
+-        drop(state);
+-        let shared = self.state.clone();
+-        let ingress = self.ingress.clone();
+-        let mut cancel = self.cancel.subscribe();
+-        #[cfg(target_os = "macos")]
+-        let inbox = self.inbox.clone();
+-        #[cfg(target_os = "macos")]
+-        let manifest = manifest.clone();
+-        let task = tokio::spawn(async move {
+-            loop {
+-                if ingress.generation() != Some(consent.generation) {
+-                    break;
+-                }
+-                let (submission, pending) = {
+-                    let mut state = shared.lock().unwrap_or_else(|e| e.into_inner());
+-                    let Some(store) = &mut state.store else { break };
+-                    #[cfg(target_os = "macos")]
+-                    if let Some(inbox) = inbox.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+-                        inbox.recover(consent, &manifest, store);
+-                    }
+-                    while let Some(observation) = ingress.queue.pop() {
+-                        let _ = store.observe(observation.generation, observation.report, observation.at, now());
+-                    }
+-                    let _ = store.checkpoint();
+-                    let next = if ingress.busy() {
+-                        None
+-                    } else {
+-                        store.prepare(consent.generation, now()).ok().flatten()
+-                    };
+-                    (next, store.has_work())
+-                };
+-                if let Some(submission) = submission {
+-                    if ingress.generation() != Some(submission.generation) {
+-                        continue;
+-                    }
+-                    let result =
+-                        tokio::select! {biased; _=cancel.changed()=>break, result=https.send(&submission)=>result};
+-                    if let Some(store) = &mut shared.lock().unwrap_or_else(|e| e.into_inner()).store {
+-                        let _ = store.complete(&submission, result);
+-                    }
+-                }
+-                tokio::select! {biased; _=cancel.changed()=>break, _=wait_for_report_batch(&ingress.wake, pending)=>{}}
+-            }
+-        });
+-        *self.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
++        // LAN-only build: never upload telemetry.
++        return;
+     }
+     fn recover_and_arm(&self, state: &mut State, consent: ReportConsent, manifest: &Manifest) {
+         let capsule = self.dir.join("capsules/agent.bin");
+
+diff --git a/packaging/windows/Package.wxs b/packaging/windows/Package.wxs
+--- a/packaging/windows/Package.wxs
++++ b/packaging/windows/Package.wxs
+@@ -104,17 +104,17 @@
+           <!-- UiExe hosts the user backend in service mode; the SYSTEM input broker and
+                recovery CLI own no LAN listeners. Keep this component/key path
+                stable so the late major-upgrade uninstall retains its rules.
+-               Scope=any also supports peers across LAN subnets/manual IP. -->
++               LAN-only build: inbound peers must be on the local subnet. -->
+           <fw:FirewallException Id="BackendUdpInbound" File="UiExe"
+                                 Name="$(var.ProductName) - Discovery and QUIC (UDP)"
+                                 Description="LAN discovery (mDNS/DNS-SD and beacons) and encrypted device links."
+                                 Grouping="$(var.ProductName)" Protocol="udp" Profile="all"
+-                                Scope="any" Outbound="no" Action="allow" Enabled="yes" IgnoreFailure="no" />
++                                Scope="localSubnet" Outbound="no" Action="allow" Enabled="yes" IgnoreFailure="no" />
+           <fw:FirewallException Id="BackendTcpInbound" File="UiExe"
+                                 Name="$(var.ProductName) - Bulk transfer (TCP)"
+                                 Description="Oink - Bulk transfer (TCP)"
+                                 Grouping="$(var.ProductName)" Protocol="tcp" Profile="all"
+-                                Scope="any" Outbound="no" Action="allow" Enabled="yes" IgnoreFailure="no" />
++                                Scope="localSubnet" Outbound="no" Action="allow" Enabled="yes" IgnoreFailure="no" />
+         </Component>
+         <Component Id="RecoveryCli" Guid="*">
+           <File Id="AgentExe" Source="$(var.Payload)/$(var.AgentExe)" KeyPath="yes" />
