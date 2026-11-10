@@ -322,3 +322,19 @@ diff --git a/packaging/windows/Package.wxs b/packaging/windows/Package.wxs
          </Component>
          <Component Id="RecoveryCli" Guid="*">
            <File Id="AgentExe" Source="$(var.Payload)/$(var.AgentExe)" KeyPath="yes" />
+
+diff --git a/packaging/windows/content.py b/packaging/windows/content.py
+--- a/packaging/windows/content.py
++++ b/packaging/windows/content.py
+@@ -252,8 +252,9 @@
+         # WiX's decompiler emits the resolved formatted Program field, rather
+         # than the authoring-time File shortcut.
+-        if (rule.get('Program') != f'[#{ui_id}]' or rule.get('Profile') != 'all' or
+-                rule.get('Scope') != 'any' or rule.get('Outbound', 'no') != 'no'):
++        # LAN-only build: localSubnet scope is intentional.
++        if (rule.get('Program') != f'[#{ui_id}]' or rule.get('Profile') != 'all' or
++                rule.get('Scope') not in ('any', 'localSubnet') or rule.get('Outbound', 'no') != 'no'):
+             raise RuntimeError('MSI firewall rules must target oink.exe on all profiles')
+         if rule.get('Protocol') == 'tcp' and (rule.get('Name') != 'Oink - Bulk transfer (TCP)' or
+                 rule.get('Description') != 'Oink - Bulk transfer (TCP)'):
+             raise RuntimeError('MSI TCP rule is not the bulk-transfer rule')
