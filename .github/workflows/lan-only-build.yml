@@ -6,6 +6,10 @@ on:
 permissions:
   contents: read
 
+env:
+  # Windows runner defaults Python to cp1252; the licenses JSON is UTF-8.
+  PYTHONUTF8: "1"
+
 jobs:
   build-windows:
     runs-on: windows-2022
@@ -14,7 +18,7 @@ jobs:
         shell: bash
     steps:
       - name: 0. Workflow version marker
-        run: echo "WORKFLOW_VERSION=5"
+        run: echo "WORKFLOW_VERSION=6"
 
       - name: 1. Checkout
         uses: actions/checkout@v4
@@ -124,14 +128,14 @@ jobs:
       - name: 11. npm ci
         working-directory: oink
         run: npm ci
-        
+
       - name: 11b. Install cargo-about 0.9.2
         run: |
           if ! cargo about --version 2>/dev/null | grep -q '0.9.2$'; then
             cargo install cargo-about --version 0.9.2 --locked --features cli
           fi
           cargo about --version
-          
+
       - name: 12. Build LAN-only MSI
         working-directory: oink
         run: python build-support/package.py --platform windows --build 1 --output-root ../build-out
